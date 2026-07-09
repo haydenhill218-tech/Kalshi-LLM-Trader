@@ -1,24 +1,37 @@
 """
 ====================================================================
-14-DAY EXIT CRITERIA  (deployed: 2026-07-09, ends: 2026-07-23)
+CYCLE 2: 14-DAY PAPER EVALUATION (deployed: 2026-07-09, ends: 2026-07-23)
 ====================================================================
+
+PAPER MODE: this cycle runs with PAPER_TRADING=true. The bot reads
+LIVE market data and makes REAL Claude decisions, but places NO real
+orders and risks NO capital. Fills are simulated (entries at the ask,
+exits at the bid, settlements at $1/$0 from actual market results).
+Simulated fills are OPTIMISTIC - no queue, no slippage - so a passing
+paper cycle is necessary but not sufficient before funding.
 
 Strategy parameters are LOCKED for 14 days from deploy date.
 Bug fixes OK. Strategy changes (TP/SL/sizing/universe/prompt) NOT OK.
 
 SUCCESS CONDITIONS (all four must be met):
   [ ] 14 calendar days complete, bot ran continuously
-  [ ] 15+ resolved trades in the trade log
-  [ ] Net trading P&L > $45 (covers ~$90/mo API + server prorated)
-  [ ] No single position exceeded 5% of balance
+  [ ] 15+ resolved trades in the (paper) trade log
+  [ ] Simulated net P&L > $45 (the bar that would cover ~$90/mo
+      API + server prorated if this were real capital)
+  [ ] No single position exceeded 5% of (paper) balance
 
 DECISION TREE:
-  All 4 met               -> fund to $1-2K, run another 14 days
+  All 4 met               -> fund real capital, run a LIVE 14-day cycle
+                             (paper passing does not skip the live test)
   Some met, near-breakeven -> one more 14-day cycle, NO fund-up
   Two inconclusive cycles  -> KILL
   P&L clearly negative     -> KILL
   Fewer than 15 trades     -> KILL (insufficient data, won't get
                               better by waiting)
+
+CYCLE 1 (2026-05-19 to 2026-06-02, real capital): KILLED per these
+criteria. 29 resolved trades, 7W/22L, ~breakeven P&L. Post-mortem in
+the README.
 
 The "well maybe with more capital" rationalization is the exact
 failure mode this checklist exists to prevent. If P&L net of costs
@@ -71,6 +84,16 @@ REVISION NOTES (bug-fix pass; strategy parameters unchanged):
 8. Honest docstring: the trade log appends forever; there is no date
    rotation. (The previous header claimed rotation that didn't exist.)
 
+9. PAPER MODE (PAPER_TRADING=true). Same code path end to end - live
+   market data, real Claude analysis and decisions, same lifecycle
+   states, same log schema - but order placement is simulated:
+   entries fill instantly at the limit (ask) price, TP/SL exits fill
+   instantly at the current bid, and settlements pay $1/$0 based on
+   the market's actual result. Paper trades log to a SEPARATE file
+   (paper_trade_log.json) and every record carries "paper": true, so
+   paper results can never contaminate real trade history. Switching
+   to live money later is one environment variable, zero code changes.
+
 Carried over from the prior version:
 - Exit orders actually exit; re-priced until they fill (rate-limited).
 - Take-profit absolute (+0.20, capped 0.97); stop-loss proportional (0.5x).
@@ -120,8 +143,17 @@ if not os.path.exists(KEY_PATH):
     sys.stderr.write(f"FATAL: Kalshi private key not found at {KEY_PATH}\n")
     sys.exit(1)
 
+# ---- Paper trading mode ----
+# PAPER_TRADING=true : live market data, real Claude decisions, but no
+# real orders and no real capital. Simulated fills, separate log file.
+PAPER_TRADING = os.environ.get("PAPER_TRADING", "").lower() in ("1", "true", "yes")
+PAPER_STARTING_BALANCE = float(os.environ.get("PAPER_STARTING_BALANCE", "200"))
+
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-LOG_FILE = os.path.join(LOG_DIR, "trade_log.json")
+if PAPER_TRADING:
+    LOG_FILE = os.path.join(LOG_DIR, "paper_trade_log.json")
+else:
+    LOG_FILE = os.path.join(LOG_DIR, "trade_log.json")
 ERROR_LOG = os.path.join(LOG_DIR, "bot_errors.log")
 
 CRYPTO_15M = []  # Removed - XRP 15-min markets had 1W/7L record, no edge
@@ -227,6 +259,18 @@ def scan_lock():
 
 def get_balance():
     """Returns balance in dollars. Raises on failure or missing field."""
+    if PAPER_TRADING:
+        # Simulated balance: starting stake plus all resolved paper P&L,
+        # minus cash currently committed to open paper positions.
+        bal = PAPER_STARTING_BALANCE
+        for t in load_trades():
+            if t.get("lifecycle") == "resolved":
+                bal += float(t.get("pnl") or 0)
+            elif t.get("lifecycle") in ("open", "exiting"):
+                entry = float(t.get("avg_entry_price") or t.get("entry_price") or 0)
+                held = int(t.get("filled_count", 0)) - int(t.get("exited_count", 0))
+                bal -= entry * max(0, held)
+        return round(bal, 2)
     data = kalshi_request("GET", "/portfolio/balance")
     # KeyError here is intentional: a response without a balance field
     # should abort the scan, not silently size trades off $0.
@@ -238,6 +282,20 @@ def get_open_positions():
     Returns list of position dicts. Raises on failure - sizing and
     dedup depend on this.
     """
+    if PAPER_TRADING:
+        # Paper positions live only in the trade log.
+        result = []
+        for t in load_trades():
+            if t.get("lifecycle") in ("open", "exiting"):
+                held = int(t.get("filled_count", 0)) - int(t.get("exited_count", 0))
+                if held > 0:
+                    result.append({
+                        "ticker": t["ticker"],
+                        "series": t.get("series", t["ticker"].split("-")[0]),
+                        "count": held,
+                        "side": t["side"],
+                    })
+        return result
     data = kalshi_request("GET", "/portfolio/positions", params={"limit": 50})
     positions = data.get("market_positions", [])
     result = []
@@ -368,12 +426,24 @@ def get_all_markets():
 
 
 def find_market(ticker):
-    """Look up a specific market by ticker."""
+    """Look up a specific OPEN market by ticker."""
     series = ticker.split("-")[0]
     for m in fetch_series_markets(series):
         if m.get("ticker") == ticker:
             return m
     return None
+
+
+def fetch_market_any_status(ticker):
+    """
+    Fetch a single market regardless of status (open, closed, settled).
+    Used by paper-mode settlement to learn the final result.
+    """
+    try:
+        data = kalshi_request("GET", f"/markets/{ticker}")
+        return data.get("market")
+    except requests.exceptions.RequestException:
+        return None
 
 
 # ---------- News ----------
@@ -577,6 +647,7 @@ def record_entry(ticker, side, price, amount, count, order_id):
         "lifecycle": "pending_entry",   # pending_entry | open | exiting | resolved
         "fill_price": None,
         "pnl": None,
+        "paper": PAPER_TRADING,
     })
     save_trades(trades)
 
@@ -608,6 +679,16 @@ def manage_entries():
             t["exit_reason"] = "entry_error_no_order_id"
             t["pnl"] = 0.0
             log.error(f"Entry for {ticker} has no order id; closing record.")
+            changed = True
+            continue
+
+        if str(oid).startswith("PAPER-"):
+            # Paper entries fill instantly at the limit (ask) price.
+            t["filled_count"] = t["requested_count"]
+            t["avg_entry_price"] = t["entry_price"]
+            t["lifecycle"] = "open"
+            log.info(f"[PAPER] ENTRY FILLED: {ticker} {t['side']} "
+                     f"{t['filled_count']} @ {t['avg_entry_price']}")
             changed = True
             continue
 
@@ -889,6 +970,19 @@ def manage_exits():
             log.error(f"{ticker} open with nothing left to sell; skipping.")
             continue
 
+        if PAPER_TRADING:
+            # Paper exits fill instantly at the current bid. Optimistic
+            # (no queue, no partial), but the bid is the honest price.
+            t["exited_count"] = int(t.get("exited_count", 0)) + remaining
+            t["exit_proceeds"] = round(
+                float(t.get("exit_proceeds", 0.0)) + remaining * current_bid, 4)
+            t["exit_reason"] = reason
+            log.info(f"[PAPER] {reason.upper()}: {ticker} {side} "
+                     f"entry={entry} exit={current_bid} x{remaining}")
+            _resolve_via_exit(t)
+            changed = True
+            continue
+
         log.info(f"{reason.upper()}: {ticker} {side} entry={entry} "
                  f"bid={current_bid} -> placing exit for {remaining}")
         try:
@@ -929,8 +1023,49 @@ def reconcile_settlements():
     If a trade was PARTIALLY exited before settlement, total P&L is
     the sum of realized exit P&L plus the settlement P&L reported by
     the API for the remaining contracts.
+
+    PAPER MODE: there are no real settlements to query. Instead, each
+    active paper trade's market is fetched directly; once the market
+    reports a final result, the position pays $1 (win) or $0 (loss)
+    per contract.
     """
     trades = load_trades()
+
+    if PAPER_TRADING:
+        changed = False
+        for t in trades:
+            if t.get("lifecycle") not in ACTIVE_LIFECYCLES:
+                continue
+            m = fetch_market_any_status(t["ticker"])
+            if not m:
+                continue
+            status = str(m.get("status", "")).lower()
+            result = str(m.get("result", "")).lower()
+            if status not in ("settled", "finalized", "determined") \
+                    or result not in ("yes", "no"):
+                continue
+
+            side = t["side"]
+            won = (side == result)
+            entry = float(t.get("avg_entry_price") or t.get("entry_price") or 0)
+            held = int(t.get("filled_count", 0)) - int(t.get("exited_count", 0))
+            payout = (1.0 if won else 0.0) * max(0, held)
+            exited = int(t.get("exited_count", 0))
+            exit_pnl = round(float(t.get("exit_proceeds", 0.0)) - entry * exited, 2)
+            settle_pnl = round(payout - entry * max(0, held), 2)
+
+            t["lifecycle"] = "resolved"
+            t["exit_reason"] = "settlement_win" if won else "settlement_loss"
+            t["fill_price"] = 1.0 if won else 0.0
+            t["pnl"] = round(settle_pnl + exit_pnl, 2)
+            log.info(f"[PAPER] SETTLED: {t['ticker']} {side} result={result} "
+                     f"pnl=${t['pnl']}")
+            changed = True
+
+        if changed:
+            save_trades(trades)
+        return
+
     settlements = get_settlements()
     changed = False
     for t in trades:
@@ -992,6 +1127,8 @@ def reconcile_position_state(open_positions):
     state is more dangerous than a loud log line. If these warnings
     fire, investigate manually before trusting the bot further.
     """
+    if PAPER_TRADING:
+        return  # No exchange positions exist to reconcile against.
     actual = {p["ticker"]: p for p in open_positions}
     log_holdings = {}
     for t in load_trades():
@@ -1192,8 +1329,24 @@ def decide(analysis, max_trade):
 # ---------- Entry placement ----------
 
 def place_entry_order(ticker, side, price_dollars, amount_dollars):
-    """Place a buy limit order. Returns (api_response_dict, count)."""
+    """Place a buy limit order. Returns (api_response_dict, count).
+
+    In paper mode: no API call. Returns a synthetic order marked with a
+    PAPER- id; manage_entries treats it as instantly filled at the
+    limit price (the ask - optimistic but reasonable for a marketable
+    limit order).
+    """
     count = max(1, int(amount_dollars / float(price_dollars)))
+    if PAPER_TRADING:
+        fake = {
+            "order": {
+                "order_id": f"PAPER-{int(time.time() * 1000)}",
+                "status": "executed",
+            }
+        }
+        log.info(f"[PAPER] simulated entry order: {ticker} {side} "
+                 f"{count} @ {float(price_dollars):.2f}")
+        return fake, count
     side_price_key = f"{side}_price_dollars"
     payload = {
         "ticker": ticker,
@@ -1380,6 +1533,14 @@ def safe_scan():
 # ---------- Entry point ----------
 
 if __name__ == "__main__":
+    if PAPER_TRADING:
+        log.info("=" * 60)
+        log.info("PAPER TRADING MODE - no real orders, no real capital.")
+        log.info(f"Simulated starting balance: ${PAPER_STARTING_BALANCE:.2f}")
+        log.info(f"Paper log: {LOG_FILE}")
+        log.info("=" * 60)
+    else:
+        log.info("LIVE TRADING MODE - real orders, real capital.")
     log.info("Bot starting up.")
     migrate_log_to_disk()  # One-shot migration of old-schema rows
     schedule.every(15).minutes.do(safe_scan)
@@ -1387,3 +1548,4 @@ if __name__ == "__main__":
     while True:
         schedule.run_pending()
         time.sleep(1)
+
