@@ -1,4 +1,4 @@
-# kalshi-llm-trader
+ kalshi-llm-trader
 
 An autonomous trading system for Kalshi prediction markets, built through AI-assisted development. I designed the system and directed the build; Claude (Anthropic) wrote the Python under my direction across 15+ iteration cycles. I'm sharing it — including the results and the post-mortem — because the discipline around the experiment matters more to me than how it ended.
 
@@ -13,6 +13,7 @@ Every 15 minutes, the bot:
 3. Runs a two-stage LLM decision pipeline — an analysis call with full market/position/history context, then a final decision made through a structured tool call that fills out a fixed schema (trade or no_trade, ticker, side, dollar amount). v1 had the decision stage emit a parseable line of text; malformed output was a real failure mode, and the structured call eliminates it
 4. Places limit orders with risk rules enforced in code, not just in the prompt: 3% max position size, price-band entry filters, dedup against held series
 5. Manages exits through a staged lifecycle (`pending_entry → open → exiting → resolved`): entries are only treated as positions once fills are confirmed, then absolute take-profit, proportional stop-loss, rate-limited order repricing, and settlement reconciliation to recover exit orders orphaned when a market settles before the exit fills
+6. Writes a per-scan audit trail: one JSON file per decision capturing exactly what the model saw (balance, news, history, markets) and what it said (raw analysis plus structured decision), so the day-14 review can answer *why* it traded, not just what happened
 
 Engineering details I'm proud of for a first system: RSA-PSS request signing for Kalshi auth, file-locked concurrency control to prevent overlapping scans, atomic trade-log writes via temp-file rename, and idempotent schema migration for the trade log.
 
@@ -55,9 +56,19 @@ None of this changes the cycle 1 verdict — the strategy failed for the structu
 
 **Cycle 2 is a paper evaluation.** v2 runs the same code path end to end — live market data, real Claude analysis — but order placement is simulated: entries fill at the ask, exits at the bid, settlements pay $1/$0 from actual market results. Paper trades log to a separate file so they can never contaminate real trade history. Paper fills are optimistic — no queue, no slippage — so a passing paper cycle earns a live test, not scaled capital. The strategy parameters are unchanged and locked, and the same pre-registered kill criteria apply: if cycle 2 doesn't clear the bar by July 23, it dies the same way cycle 1 did.
 
+## Strategy capacity (the ceiling if it works)
+
+There's a structural problem with this bot that exists even in the scenario where everything goes right: the markets it trades are thin. Daily crypto and weekly commodity contracts on Kalshi often have modest resting liquidity, which means order size works against you. Small orders fill cleanly at quoted prices; larger orders eat through the book, move the price, or sit partially filled. Every strategy has a maximum amount of capital it can absorb before the act of trading it erodes the edge — and this one's ceiling is low.
+
+Rough math: if these markets absorb perhaps $50–100 per order before fill quality degrades, then at 3% position sizing the effective bankroll caps out around $2–3K. Beyond that, added capital doesn't add returns — it adds slippage. And that connects back to the cycle 1 post-mortem: at the scale these markets allow, even a genuinely working strategy may struggle to clear its own ~$90/month API costs. The edge doesn't have to be fake to be uneconomical.
+
+This is why the cycle 2 paper balance is $2,000 — the top of the pre-registered funding range, and roughly the largest bankroll where simulated instant fills still resemble what real order books would give. Testing at a size the markets can't actually support would produce results from a market that doesn't exist.
+
+If the strategy ever earns a scale-up, the levers are known and non-trivial: widening the market universe (capacity is roughly additive across uncorrelated markets), switching from spread-crossing to passive resting orders, or slicing orders — all cycle 3+ work, and any scale-up test must model slippage rather than assume clean fills. Alternatively: accept the ceiling and treat it as a small machine with a known maximum output. Being small is retail's one structural advantage — you can harvest edges too tiny for serious capital to bother with.
+
 ## Repo contents
 
-- `kalshi_bot.py` — the full system (~1,550 lines), including the pre-registered evaluation criteria in the module docstring. v1 is preserved in the commit history.
+- `kalshi_bot.py` — the full system (~1,590 lines), including the pre-registered evaluation criteria in the module docstring. v1 is preserved in the commit history.
 
-Secrets are loaded from environment variables (`ANTHROPIC_API_KEY`, `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`); the bot hard-fails if they're missing. Paper mode is a single environment variable (`PAPER_TRADING=true`).
+Secrets are loaded from environment variables (`ANTHROPIC_API_KEY`, `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`); the bot hard-fails if they're missing. Paper mode is a single environment variable (`PAPER_TRADING=true`), with the simulated bankroll set by `PAPER_STARTING_BALANCE`.
 
