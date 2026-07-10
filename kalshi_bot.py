@@ -113,8 +113,10 @@ REVISION NOTES (bug-fix pass; strategy parameters unchanged):
     (b) Volume read from the wrong field: the prompt showed "vol=?"
         for every market, which tripped the thin-volume HARD REJECT
         on everything and would have produced a no-trade cycle by
-        plumbing error. Now reads volume_24h (falling back to
-        lifetime volume).
+        plumbing error. v2.1 guessed volume_24h; v2.1.1 verified
+        against the live API - Kalshi uses fixed-point field names
+        volume_24h_fp / volume_fp. Now reads those (with legacy
+        fallbacks).
     (c) No current date in the prompt: the model could not correctly
         judge time-to-close, breaking the "resolves in under 1 hour"
         and "imminent catalyst" rules. The analysis context now
@@ -1320,11 +1322,21 @@ def analyze(markets, news, learning, balance, max_trade, open_positions_str):
         title = str(m.get("title", m.get("event_title", "")))[:40]
         ask = m.get("yes_ask_dollars")
         bid = m.get("yes_bid_dollars")
-        # Kalshi exposes 24h volume as volume_24h and lifetime volume
-        # as volume; prefer 24h (what the thin-volume rule is about).
-        volume = m.get("volume_24h")
-        if volume in (None, ""):
-            volume = m.get("volume", 0)
+        # Kalshi exposes volume in fixed-point fields: volume_24h_fp
+        # (last 24h) and volume_fp (lifetime). Prefer 24h - that is
+        # what the thin-volume rule is about. Older field names kept
+        # as fallbacks. Verified against the live API 2026-07-10.
+        volume = None
+        for field in ("volume_24h_fp", "volume_24h", "volume_fp", "volume"):
+            v = m.get(field)
+            if v not in (None, ""):
+                try:
+                    volume = int(float(v))
+                except (TypeError, ValueError):
+                    continue
+                break
+        if volume is None:
+            volume = "unknown"
         close_time = m.get("close_time", "?")
         no_ask = m.get("no_ask_dollars", "?")
         parts.append(
@@ -1332,7 +1344,7 @@ def analyze(markets, news, learning, balance, max_trade, open_positions_str):
             f"vol24h={volume} closes={close_time}"
         )
     summary = " | ".join(parts)
-    now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     resp = client.messages.create(
         model="claude-sonnet-4-6",
@@ -1643,5 +1655,3 @@ if __name__ == "__main__":
     while True:
         schedule.run_pending()
         time.sleep(1)
-
-
