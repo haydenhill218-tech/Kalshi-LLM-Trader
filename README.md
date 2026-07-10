@@ -68,7 +68,7 @@ If the strategy ever earns a scale-up, the levers are known and non-trivial: wid
 
 ## Repo contents
 
-- `kalshi_bot.py` — the full system (~1,601 lines), including the pre-registered evaluation criteria in the module docstring. v1 is preserved in the commit history.
+- `kalshi_bot.py` — the full system (~1,657 lines), including the pre-registered evaluation criteria in the module docstring. v1 is preserved in the commit history.
 
 Secrets are loaded from environment variables (`ANTHROPIC_API_KEY`, `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`); the bot hard-fails if they're missing. Paper mode is a single environment variable (`PAPER_TRADING=true`), with the simulated bankroll set by `PAPER_STARTING_BALANCE`.
 
