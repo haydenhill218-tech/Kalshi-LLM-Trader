@@ -39,7 +39,9 @@ Applying my own pre-committed criteria: the strategy had not earned additional c
 
 ## Operations lesson
 
-The bot ran in an unsupervised `screen` session. It crashed silently ~36 hours into the evaluation window, and I didn't discover this for weeks. Cycle 2 fixes this directly: the bot now runs under systemd with a restart policy, plus an external heartbeat script that alerts me if the log goes silent — and it runs on paper before it touches live capital again.
+The honest version: the bot didn't crash — I turned it off. Watching it lose trade after trade, I got fatigued and shut it down manually partway through the evaluation window, before my own pre-registered end date. That's a worse failure than a crash, because it was the exact behavior the locked-parameters rule existed to prevent: the operator overriding the experiment mid-test because the results felt bad.
+
+Cycle 2 is engineered against *me* as much as against bugs. The bot runs under systemd with a restart policy, an external heartbeat pings my phone if it ever goes silent, and — most importantly — it's running on paper, so there's no P&L pain to tempt an early shutdown. The rule for this cycle is simple: the only hand that stops the bot before day 14 is the pre-registered kill criteria, not my mood.
 
 ## Post-kill engineering review (v2)
 
